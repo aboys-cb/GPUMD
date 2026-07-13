@@ -27,6 +27,7 @@ heat transport, Phys. Rev. B. 104, 104309 (2021).
 #include "utilities/error.cuh"
 #include "utilities/gpu_macro.cuh"
 #include "utilities/nep_utilities.cuh"
+#include "utilities/read_file.cuh"
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -330,9 +331,31 @@ NEP::NEP(const char* file_potential, const int num_atoms)
     tokens = get_tokens(input);
     parameters[n] = get_double_from_token(tokens[0], __FILE__, __LINE__);
   }
+
+  // Store descriptor coefficients for each type pair contiguously. All the
+  // descriptor and force kernels consume one type pair at a time.
+  std::vector<float> descriptor_parameters(num_para_descriptor);
+  const int radial_basis_count =
+    (paramb.n_max_radial + 1) * (paramb.basis_size_radial + 1);
+  const int angular_basis_count =
+    (paramb.n_max_angular + 1) * (paramb.basis_size_angular + 1);
+  for (int type_pair = 0; type_pair < paramb.num_types_sq; ++type_pair) {
+    for (int basis = 0; basis < radial_basis_count; ++basis) {
+      descriptor_parameters[type_pair * radial_basis_count + basis] =
+        parameters[annmb.num_para_ann + basis * paramb.num_types_sq + type_pair];
+    }
+    for (int basis = 0; basis < angular_basis_count; ++basis) {
+      descriptor_parameters[paramb.num_c_radial + type_pair * angular_basis_count + basis] =
+        parameters[
+          annmb.num_para_ann + paramb.num_c_radial + basis * paramb.num_types_sq + type_pair];
+    }
+  }
   nep_data.parameters.resize(annmb.num_para + annmb.dim);
   nep_data.parameters.copy_from_host(parameters.data());
+  nep_data.descriptor_parameters_type_pair.resize(num_para_descriptor);
+  nep_data.descriptor_parameters_type_pair.copy_from_host(descriptor_parameters.data());
   update_potential(nep_data.parameters.data(), annmb);
+  annmb.c_type_pair = nep_data.descriptor_parameters_type_pair.data();
   annmb.q_scaler = nep_data.parameters.data() + annmb.num_para;
 
   // flexible zbl potential parameters
@@ -360,6 +383,7 @@ NEP::NEP(const char* file_potential, const int num_atoms)
   nep_data.cpu_NN_angular.resize(num_atoms);
 
   initialize_dftd3();
+  need_peratom_virial = check_need_peratom_virial();
   B_projection_size = annmb.num_neurons1 * (annmb.dim + 2);
 }
 
@@ -454,6 +478,7 @@ static __global__ void find_neighbor_list_large_box(
   g_NN_angular[n1] = count_angular;
 }
 
+template <bool use_radial_basis_sums>
 static __global__ void find_descriptor(
   NEP::ParaMB paramb,
   NEP::ANN annmb,
@@ -486,30 +511,67 @@ static __global__ void find_descriptor(
     double z1 = g_z[n1];
     float q[MAX_DIM] = {0.0f};
 
-    // get radial descriptors
-    for (int i1 = 0; i1 < g_NN[n1]; ++i1) {
-      int n2 = g_NL[static_cast<size_t>(N) * i1 + n1];
-      float x12 = g_x[n2] - x1;
-      float y12 = g_y[n2] - y1;
-      float z12 = g_z[n2] - z1;
-      apply_mic(box, x12, y12, z12);
-      float d12 = sqrt(x12 * x12 + y12 * y12 + z12 * z12);
-      float fc12;
-      int t2 = g_type[n2];
-      float rc = (paramb.rc_radial[t1] + paramb.rc_radial[t2]) * 0.5f;
-      float rcinv = 1.0f / rc;
-      find_fc(rc, rcinv, d12, fc12);
-      float fn12[MAX_NUM_N];
+    if (use_radial_basis_sums) {
+      extern __shared__ float radial_basis_sums[];
+      const int basis_count = paramb.basis_size_radial + 1;
+      for (int k = 0; k < basis_count; ++k) {
+        radial_basis_sums[k * blockDim.x + threadIdx.x] = 0.0f;
+      }
 
-      find_fn(paramb.basis_size_radial, rcinv, d12, fc12, fn12);
-      for (int n = 0; n <= paramb.n_max_radial; ++n) {
-        float gn12 = 0.0f;
-        for (int k = 0; k <= paramb.basis_size_radial; ++k) {
-          int c_index = (n * (paramb.basis_size_radial + 1) + k) * paramb.num_types_sq;
-          c_index += t1 * paramb.num_types + t2;
-          gn12 += fn12[k] * annmb.c[c_index];
+      for (int i1 = 0; i1 < g_NN[n1]; ++i1) {
+        int n2 = g_NL[static_cast<size_t>(N) * i1 + n1];
+        int t2 = g_type[n2];
+        float x12 = g_x[n2] - x1;
+        float y12 = g_y[n2] - y1;
+        float z12 = g_z[n2] - z1;
+        apply_mic(box, x12, y12, z12);
+        float d12 = sqrt(x12 * x12 + y12 * y12 + z12 * z12);
+        float fc12;
+        float rc = (paramb.rc_radial[t1] + paramb.rc_radial[t2]) * 0.5f;
+        float rcinv = 1.0f / rc;
+        find_fc(rc, rcinv, d12, fc12);
+        float fn12[MAX_NUM_N];
+        find_fn(paramb.basis_size_radial, rcinv, d12, fc12, fn12);
+        for (int k = 0; k < basis_count; ++k) {
+          radial_basis_sums[k * blockDim.x + threadIdx.x] += fn12[k];
         }
-        q[n] += gn12;
+      }
+
+      for (int n = 0; n <= paramb.n_max_radial; ++n) {
+        float value = 0.0f;
+        for (int k = 0; k < basis_count; ++k) {
+          value += radial_basis_sums[k * blockDim.x + threadIdx.x] *
+            annmb.c_type_pair[n * basis_count + k];
+        }
+        q[n] = value;
+      }
+    } else {
+      // get radial descriptors
+      for (int i1 = 0; i1 < g_NN[n1]; ++i1) {
+        int n2 = g_NL[static_cast<size_t>(N) * i1 + n1];
+        float x12 = g_x[n2] - x1;
+        float y12 = g_y[n2] - y1;
+        float z12 = g_z[n2] - z1;
+        apply_mic(box, x12, y12, z12);
+        float d12 = sqrt(x12 * x12 + y12 * y12 + z12 * z12);
+        float fc12;
+        int t2 = g_type[n2];
+        float rc = (paramb.rc_radial[t1] + paramb.rc_radial[t2]) * 0.5f;
+        float rcinv = 1.0f / rc;
+        find_fc(rc, rcinv, d12, fc12);
+        float fn12[MAX_NUM_N];
+        find_fn(paramb.basis_size_radial, rcinv, d12, fc12, fn12);
+        for (int n = 0; n <= paramb.n_max_radial; ++n) {
+          float gn12 = 0.0f;
+          for (int k = 0; k <= paramb.basis_size_radial; ++k) {
+            int c_index =
+              (t1 * paramb.num_types + t2) *
+                ((paramb.n_max_radial + 1) * (paramb.basis_size_radial + 1)) +
+              n * (paramb.basis_size_radial + 1) + k;
+            gn12 += fn12[k] * annmb.c_type_pair[c_index];
+          }
+          q[n] += gn12;
+        }
       }
     }
 
@@ -532,9 +594,12 @@ static __global__ void find_descriptor(
         find_fn(paramb.basis_size_angular, rcinv, d12, fc12, fn12);
         float gn12 = 0.0f;
         for (int k = 0; k <= paramb.basis_size_angular; ++k) {
-          int c_index = (n * (paramb.basis_size_angular + 1) + k) * paramb.num_types_sq;
-          c_index += t1 * paramb.num_types + t2 + paramb.num_c_radial;
-          gn12 += fn12[k] * annmb.c[c_index];
+          int c_index =
+            paramb.num_c_radial +
+            (t1 * paramb.num_types + t2) *
+              ((paramb.n_max_angular + 1) * (paramb.basis_size_angular + 1)) +
+            n * (paramb.basis_size_angular + 1) + k;
+          gn12 += fn12[k] * annmb.c_type_pair[c_index];
         }
         accumulate_s(paramb.L_max, d12, x12, y12, z12, gn12, s);
       }
@@ -685,9 +750,12 @@ static __global__ void find_force_radial(
         float gnp12 = 0.0f;
         float gnp21 = 0.0f;
         for (int k = 0; k <= paramb.basis_size_radial; ++k) {
-          int c_index = (n * (paramb.basis_size_radial + 1) + k) * paramb.num_types_sq;
-          gnp12 += fnp12[k] * annmb.c[c_index + t1 * paramb.num_types + t2];
-          gnp21 += fnp12[k] * annmb.c[c_index + t2 * paramb.num_types + t1];
+          int basis = n * (paramb.basis_size_radial + 1) + k;
+          int basis_count = (paramb.n_max_radial + 1) * (paramb.basis_size_radial + 1);
+          gnp12 +=
+            fnp12[k] * annmb.c_type_pair[(t1 * paramb.num_types + t2) * basis_count + basis];
+          gnp21 +=
+            fnp12[k] * annmb.c_type_pair[(t2 * paramb.num_types + t1) * basis_count + basis];
         }
         float tmp12 = g_Fp[static_cast<size_t>(N) * n + n1] * gnp12 * d12inv;
         float tmp21 = g_Fp[static_cast<size_t>(N) * n + n2] * gnp21 * d12inv;
@@ -797,10 +865,13 @@ static __global__ void find_partial_force_angular(
         float gn12 = 0.0f;
         float gnp12 = 0.0f;
         for (int k = 0; k <= paramb.basis_size_angular; ++k) {
-          int c_index = (n * (paramb.basis_size_angular + 1) + k) * paramb.num_types_sq;
-          c_index += t1 * paramb.num_types + t2 + paramb.num_c_radial;
-          gn12 += fn12[k] * annmb.c[c_index];
-          gnp12 += fnp12[k] * annmb.c[c_index];
+          int c_index =
+            paramb.num_c_radial +
+            (t1 * paramb.num_types + t2) *
+              ((paramb.n_max_angular + 1) * (paramb.basis_size_angular + 1)) +
+            n * (paramb.basis_size_angular + 1) + k;
+          gn12 += fn12[k] * annmb.c_type_pair[c_index];
+          gnp12 += fnp12[k] * annmb.c_type_pair[c_index];
         }
         accumulate_f12(
           paramb.L_max,
@@ -821,6 +892,744 @@ static __global__ void find_partial_force_angular(
       g_f12z[index] = f12[2];
     }
   }
+}
+
+static __device__ __forceinline__ void add_angular_derivative(
+  const float gn_scale,
+  const float gnp_scale,
+  const float value,
+  const float gradient_x,
+  const float gradient_y,
+  const float gradient_z,
+  const float inverse_distance,
+  const float* unit,
+  float* force)
+{
+  const float projection = gradient_x * unit[0] + gradient_y * unit[1] + gradient_z * unit[2];
+  const float radial = gnp_scale * value;
+  const float angular = gn_scale * inverse_distance;
+  force[0] += radial * unit[0] + angular * (gradient_x - unit[0] * projection);
+  force[1] += radial * unit[1] + angular * (gradient_y - unit[1] * projection);
+  force[2] += radial * unit[2] + angular * (gradient_z - unit[2] * projection);
+}
+
+static __device__ __forceinline__ int get_angular_channel(const int component)
+{
+  if (component < 3) {
+    return 0;
+  }
+  if (component < 8) {
+    return 1;
+  }
+  if (component < 15) {
+    return 2;
+  }
+  return 3;
+}
+
+static __device__ __forceinline__ float get_angular_weight(const int component)
+{
+  switch (component) {
+    case 0:
+      return 2.0f * 0.238732414637843f;
+    case 1:
+    case 2:
+      return 4.0f * 0.119366207318922f;
+    case 3:
+      return 2.0f * 0.099471839432435f;
+    case 4:
+    case 5:
+      return 4.0f * 0.596831036594608f;
+    case 6:
+    case 7:
+      return 4.0f * 0.149207759148652f;
+    case 8:
+      return 2.0f * 0.139260575205408f;
+    case 9:
+    case 10:
+      return 4.0f * 0.104445431404056f;
+    case 11:
+    case 12:
+      return 4.0f * 1.044454314040563f;
+    case 13:
+    case 14:
+      return 4.0f * 0.174075719006761f;
+    case 15:
+      return 2.0f * 0.011190581936149f;
+    case 16:
+    case 17:
+      return 4.0f * 0.223811638722978f;
+    case 18:
+    case 19:
+      return 4.0f * 0.111905819361489f;
+    case 20:
+    case 21:
+      return 4.0f * 1.566681471060845f;
+    default:
+      return 4.0f * 0.195835183882606f;
+  }
+}
+
+struct AngularCubicTerm {
+  unsigned char component0;
+  unsigned char component1;
+  unsigned char component2;
+  unsigned char coefficient;
+  signed char sign;
+};
+
+__constant__ AngularCubicTerm Q112_TERMS[8] = {
+  {0, 0, 3, 0, 1}, {0, 1, 4, 1, 1}, {0, 2, 5, 1, 1}, {3, 1, 1, 2, 1},
+  {3, 2, 2, 2, 1}, {6, 1, 1, 3, 1}, {6, 2, 2, 3, -1}, {1, 2, 7, 4, 1}};
+
+__constant__ AngularCubicTerm Q123_TERMS[21] = {
+  {12, 2, 4, 6, 1}, {11, 2, 5, 6, -1}, {1, 11, 4, 6, 1}, {1, 12, 5, 6, 1},
+  {0, 11, 6, 5, 1}, {0, 12, 7, 5, 1}, {14, 2, 6, 3, 1}, {13, 2, 7, 3, -1},
+  {1, 13, 6, 3, 1}, {1, 14, 7, 3, 1}, {10, 0, 5, 4, 1}, {0, 4, 9, 4, 1},
+  {10, 2, 3, 1, 1}, {0, 3, 8, 1, 1}, {1, 3, 9, 1, 1}, {10, 2, 6, 0, 1},
+  {10, 1, 7, 0, -1}, {2, 7, 9, 0, -1}, {1, 6, 9, 0, -1}, {2, 5, 8, 2, -1},
+  {1, 4, 8, 2, -1}};
+
+__constant__ AngularCubicTerm Q233_TERMS[24] = {
+  {3, 8, 8, 0, 1}, {10, 10, 3, 1, 1}, {3, 9, 9, 1, 1}, {10, 10, 6, 2, -1},
+  {6, 9, 9, 2, 1}, {4, 8, 9, 3, 1}, {10, 5, 8, 3, 1}, {13, 13, 3, 4, -1},
+  {14, 14, 3, 4, -1}, {14, 7, 9, 5, -1}, {13, 6, 9, 5, -1}, {10, 14, 6, 5, -1},
+  {10, 13, 7, 5, 1}, {10, 7, 9, 6, 1}, {11, 6, 8, 7, -1}, {12, 7, 8, 7, -1},
+  {11, 4, 9, 8, 1}, {12, 5, 9, 8, 1}, {10, 12, 4, 8, 1}, {10, 11, 5, 8, -1},
+  {12, 14, 4, 9, 1}, {11, 14, 5, 9, 1}, {13, 11, 4, 9, 1}, {13, 12, 5, 9, -1}};
+
+__constant__ AngularCubicTerm Q134_TERMS[31] = {
+  {10, 15, 2, 0, -1}, {1, 15, 9, 0, -1}, {0, 15, 8, 1, 1}, {1, 13, 18, 2, -1},
+  {1, 14, 19, 2, -1}, {2, 14, 18, 2, -1}, {2, 13, 19, 2, 1}, {10, 18, 2, 3, -1},
+  {1, 10, 19, 3, 1}, {1, 18, 9, 3, 1}, {2, 19, 9, 3, 1}, {1, 16, 8, 4, 1},
+  {2, 17, 8, 4, 1}, {0, 10, 17, 5, 1}, {0, 16, 9, 5, 1}, {1, 11, 16, 5, -1},
+  {1, 12, 17, 5, -1}, {2, 12, 16, 5, -1}, {2, 11, 17, 5, 1}, {1, 13, 22, 6, 1},
+  {1, 14, 23, 6, 1}, {2, 14, 22, 6, -1}, {2, 13, 23, 6, 1}, {0, 11, 18, 7, 1},
+  {0, 12, 19, 7, 1}, {0, 13, 20, 8, 1}, {0, 14, 21, 8, 1}, {1, 11, 20, 9, 1},
+  {1, 12, 21, 9, 1}, {2, 12, 20, 9, -1}, {2, 11, 21, 9, 1}};
+
+static __device__ __noinline__ void add_cubic_pull(
+  const AngularCubicTerm* terms,
+  const int num_terms,
+  const float* coefficients,
+  const float Fp,
+  const float* sum,
+  float* pull)
+{
+  for (int index = 0; index < num_terms; ++index) {
+    const AngularCubicTerm term = terms[index];
+    const float scale = Fp * coefficients[term.coefficient] * static_cast<float>(term.sign);
+    pull[term.component0] += scale * sum[term.component1] * sum[term.component2];
+    pull[term.component1] += scale * sum[term.component0] * sum[term.component2];
+    pull[term.component2] += scale * sum[term.component0] * sum[term.component1];
+  }
+}
+
+static __device__ __forceinline__ void build_l4_angular_pull(
+  const NEP::ParaMB paramb,
+  const float* sum,
+  const float* Fp,
+  float* pull)
+{
+#pragma unroll
+  for (int component = 0; component < 24; ++component) {
+    pull[component] =
+      get_angular_weight(component) * sum[component] * Fp[get_angular_channel(component)];
+  }
+
+  int channel = 4;
+  if (paramb.has_q_222) {
+    const float s3 = sum[3];
+    const float s4 = sum[4];
+    const float s5 = sum[5];
+    const float s6 = sum[6];
+    const float s7 = sum[7];
+    const float Fp_q222 = Fp[channel++];
+    pull[3] += Fp_q222 *
+      (-0.022498442479992f * s3 * s3 - 0.134990654879954f * (s4 * s4 + s5 * s5) +
+       0.067495327439977f * (s6 * s6 + s7 * s7));
+    pull[4] += Fp_q222 *
+      (-0.269981309759908f * s3 * s4 - 0.809943929279722f * s6 * s4 -
+       0.809943929279723f * s5 * s7);
+    pull[5] += Fp_q222 *
+      (-0.269981309759908f * s3 * s5 + 0.809943929279722f * s6 * s5 -
+       0.809943929279723f * s4 * s7);
+    pull[6] += Fp_q222 *
+      (0.134990654879954f * s3 * s6 + 0.404971964639861f * (s5 * s5 - s4 * s4));
+    pull[7] += Fp_q222 *
+      (0.134990654879954f * s3 * s7 - 0.809943929279723f * s4 * s5);
+  }
+
+  if (paramb.has_q_1111) {
+    const float s0_squared = sum[0] * sum[0];
+    const float s12_squared = sum[1] * sum[1] + sum[2] * sum[2];
+    const float Fp_q1111 = Fp[channel++];
+    pull[0] += Fp_q1111 *
+      (0.106387242824456f * sum[0] * s0_squared + 0.106387242824454f * sum[0] * s12_squared);
+    pull[1] += Fp_q1111 *
+      (0.106387242824454f * s0_squared * sum[1] + 0.106387242824456f * s12_squared * sum[1]);
+    pull[2] += Fp_q1111 *
+      (0.106387242824454f * s0_squared * sum[2] + 0.106387242824456f * s12_squared * sum[2]);
+  }
+  if (paramb.has_q_112) {
+    add_cubic_pull(Q112_TERMS, 8, C4B2, Fp[channel++], sum, pull);
+  }
+  if (paramb.has_q_123) {
+    add_cubic_pull(Q123_TERMS, 21, C4B_123, Fp[channel++], sum, pull);
+  }
+  if (paramb.has_q_233) {
+    add_cubic_pull(Q233_TERMS, 24, C4B_233, Fp[channel++], sum, pull);
+  }
+  if (paramb.has_q_134) {
+    add_cubic_pull(Q134_TERMS, 31, C4B_134, Fp[channel], sum, pull);
+  }
+}
+
+static __device__ __forceinline__ void accumulate_angular_component(
+  const int component,
+  const float gn_scale,
+  const float gnp_scale,
+  const float inverse_distance,
+  const float* unit,
+  float* force)
+{
+  const float x = unit[0];
+  const float y = unit[1];
+  const float z = unit[2];
+  const float x2 = x * x;
+  const float y2 = y * y;
+  const float z2 = z * z;
+  const float x2_minus_y2 = x2 - y2;
+  const float two_xy = 2.0f * x * y;
+  const float x3_minus_3xy2 = x * x2_minus_y2 - y * two_xy;
+  const float three_x2y_minus_y3 = x * two_xy + y * x2_minus_y2;
+
+  switch (component) {
+    case 0:
+      add_angular_derivative(gn_scale, gnp_scale, z, 0.0f, 0.0f, 1.0f, inverse_distance, unit, force);
+      break;
+    case 1:
+      add_angular_derivative(gn_scale, gnp_scale, x, 1.0f, 0.0f, 0.0f, inverse_distance, unit, force);
+      break;
+    case 2:
+      add_angular_derivative(gn_scale, gnp_scale, y, 0.0f, 1.0f, 0.0f, inverse_distance, unit, force);
+      break;
+    case 3:
+      add_angular_derivative(
+        gn_scale, gnp_scale, -1.0f + 3.0f * z2, 0.0f, 0.0f, 6.0f * z, inverse_distance, unit, force);
+      break;
+    case 4:
+      add_angular_derivative(gn_scale, gnp_scale, z * x, z, 0.0f, x, inverse_distance, unit, force);
+      break;
+    case 5:
+      add_angular_derivative(gn_scale, gnp_scale, z * y, 0.0f, z, y, inverse_distance, unit, force);
+      break;
+    case 6:
+      add_angular_derivative(
+        gn_scale, gnp_scale, x2_minus_y2, 2.0f * x, -2.0f * y, 0.0f, inverse_distance, unit, force);
+      break;
+    case 7:
+      add_angular_derivative(
+        gn_scale, gnp_scale, two_xy, 2.0f * y, 2.0f * x, 0.0f, inverse_distance, unit, force);
+      break;
+    case 8:
+      add_angular_derivative(
+        gn_scale,
+        gnp_scale,
+        -3.0f * z + 5.0f * z * z2,
+        0.0f,
+        0.0f,
+        -3.0f + 15.0f * z2,
+        inverse_distance,
+        unit,
+        force);
+      break;
+    case 9: {
+      const float a = -1.0f + 5.0f * z2;
+      add_angular_derivative(gn_scale, gnp_scale, a * x, a, 0.0f, 10.0f * x * z, inverse_distance, unit, force);
+      break;
+    }
+    case 10: {
+      const float a = -1.0f + 5.0f * z2;
+      add_angular_derivative(gn_scale, gnp_scale, a * y, 0.0f, a, 10.0f * y * z, inverse_distance, unit, force);
+      break;
+    }
+    case 11:
+      add_angular_derivative(
+        gn_scale,
+        gnp_scale,
+        z * x2_minus_y2,
+        2.0f * x * z,
+        -2.0f * y * z,
+        x2_minus_y2,
+        inverse_distance,
+        unit,
+        force);
+      break;
+    case 12:
+      add_angular_derivative(
+        gn_scale,
+        gnp_scale,
+        z * two_xy,
+        2.0f * y * z,
+        2.0f * x * z,
+        two_xy,
+        inverse_distance,
+        unit,
+        force);
+      break;
+    case 13:
+      add_angular_derivative(
+        gn_scale,
+        gnp_scale,
+        x3_minus_3xy2,
+        3.0f * x2 - 3.0f * y2,
+        -6.0f * x * y,
+        0.0f,
+        inverse_distance,
+        unit,
+        force);
+      break;
+    case 14:
+      add_angular_derivative(
+        gn_scale,
+        gnp_scale,
+        three_x2y_minus_y3,
+        6.0f * x * y,
+        3.0f * x2 - 3.0f * y2,
+        0.0f,
+        inverse_distance,
+        unit,
+        force);
+      break;
+    case 15:
+      add_angular_derivative(
+        gn_scale,
+        gnp_scale,
+        3.0f - 30.0f * z2 + 35.0f * z2 * z2,
+        0.0f,
+        0.0f,
+        -60.0f * z + 140.0f * z * z2,
+        inverse_distance,
+        unit,
+        force);
+      break;
+    case 16: {
+      const float z_factor = -3.0f * z + 7.0f * z * z2;
+      add_angular_derivative(
+        gn_scale, gnp_scale, z_factor * x, z_factor, 0.0f, (-3.0f + 21.0f * z2) * x, inverse_distance, unit, force);
+      break;
+    }
+    case 17: {
+      const float z_factor = -3.0f * z + 7.0f * z * z2;
+      add_angular_derivative(
+        gn_scale, gnp_scale, z_factor * y, 0.0f, z_factor, (-3.0f + 21.0f * z2) * y, inverse_distance, unit, force);
+      break;
+    }
+    case 18: {
+      const float a = -1.0f + 7.0f * z2;
+      add_angular_derivative(
+        gn_scale,
+        gnp_scale,
+        a * x2_minus_y2,
+        2.0f * x * a,
+        -2.0f * y * a,
+        14.0f * z * x2_minus_y2,
+        inverse_distance,
+        unit,
+        force);
+      break;
+    }
+    case 19: {
+      const float a = -1.0f + 7.0f * z2;
+      add_angular_derivative(
+        gn_scale,
+        gnp_scale,
+        a * two_xy,
+        2.0f * y * a,
+        2.0f * x * a,
+        14.0f * z * two_xy,
+        inverse_distance,
+        unit,
+        force);
+      break;
+    }
+    case 20:
+      add_angular_derivative(
+        gn_scale,
+        gnp_scale,
+        z * x3_minus_3xy2,
+        z * (3.0f * x2 - 3.0f * y2),
+        z * (-6.0f * x * y),
+        x3_minus_3xy2,
+        inverse_distance,
+        unit,
+        force);
+      break;
+    case 21:
+      add_angular_derivative(
+        gn_scale,
+        gnp_scale,
+        z * three_x2y_minus_y3,
+        z * 6.0f * x * y,
+        z * (3.0f * x2 - 3.0f * y2),
+        three_x2y_minus_y3,
+        inverse_distance,
+        unit,
+        force);
+      break;
+    case 22: {
+      const float value = x * x3_minus_3xy2 - y * three_x2y_minus_y3;
+      add_angular_derivative(
+        gn_scale,
+        gnp_scale,
+        value,
+        4.0f * x * x2 - 12.0f * x * y2,
+        -12.0f * x2 * y + 4.0f * y * y2,
+        0.0f,
+        inverse_distance,
+        unit,
+        force);
+      break;
+    }
+    default: {
+      const float value = x * three_x2y_minus_y3 + y * x3_minus_3xy2;
+      add_angular_derivative(
+        gn_scale,
+        gnp_scale,
+        value,
+        12.0f * x2 * y - 4.0f * y * y2,
+        4.0f * x * x2 - 12.0f * x * y2,
+        0.0f,
+        inverse_distance,
+        unit,
+        force);
+      break;
+    }
+  }
+}
+
+template <int num_angular_orders>
+static __device__ __forceinline__ void find_angular_radial_response(
+  const int basis_size,
+  const float cutoff,
+  const float inverse_cutoff,
+  const float distance,
+  const float* coefficients,
+  float (&gn)[num_angular_orders],
+  float (&gnp)[num_angular_orders])
+{
+  float fc = 0.0f;
+  float fcp = 0.0f;
+  find_fc_and_fcp(cutoff, inverse_cutoff, distance, fc, fcp);
+  float fn[MAX_NUM_N];
+  float fnp[MAX_NUM_N];
+  find_fn_and_fnp(basis_size, inverse_cutoff, distance, fc, fcp, fn, fnp);
+  for (int k = 0; k <= basis_size; ++k) {
+#pragma unroll
+    for (int n = 0; n < num_angular_orders; ++n) {
+      const float coefficient = coefficients[n * (basis_size + 1) + k];
+      gn[n] += fn[k] * coefficient;
+      gnp[n] += fnp[k] * coefficient;
+    }
+  }
+}
+
+template <int num_angular_orders, int subwarp_size>
+static __device__ __forceinline__ void contract_angular_pull(
+  const float* pull,
+  const int source_lane,
+  const float (&gn)[num_angular_orders],
+  const float (&gnp)[num_angular_orders],
+  float& gn_scale,
+  float& gnp_scale)
+{
+  gn_scale = 0.0f;
+  gnp_scale = 0.0f;
+#pragma unroll
+  for (int n = 0; n < num_angular_orders; ++n) {
+    const float pull_value = __shfl_sync(0xffffffffu, pull[n], source_lane, subwarp_size);
+    gn_scale += pull_value * gn[n];
+    gnp_scale += pull_value * gnp[n];
+  }
+}
+
+template <int num_angular_orders>
+static __global__ void find_force_angular_l4(
+  NEP::ParaMB paramb,
+  NEP::ANN annmb,
+  const int N,
+  const int N1,
+  const int N2,
+  const Box box,
+  const int* g_NN_angular,
+  const int* g_NL_angular,
+  const int* __restrict__ g_type,
+  const double* __restrict__ g_x,
+  const double* __restrict__ g_y,
+  const double* __restrict__ g_z,
+  const float* __restrict__ g_Fp,
+  const float* __restrict__ g_sum_fxyz,
+  double* g_fx,
+  double* g_fy,
+  double* g_fz,
+  double* g_virial)
+{
+  constexpr int num_angular_components = 24;
+  constexpr int max_angular_channels = 10;
+  constexpr int atoms_per_warp = 4;
+  constexpr int edges_per_atom = 8;
+  constexpr int rounds = num_angular_components / edges_per_atom;
+  constexpr int sum_per_atom = num_angular_orders * num_angular_components;
+  constexpr int Fp_per_atom = num_angular_orders * max_angular_channels;
+  const int lane = threadIdx.x;
+  const int atom_in_warp = lane / edges_per_atom;
+  const int edge_lane = lane % edges_per_atom;
+  const int atom_base = N1 + blockIdx.x * atoms_per_warp;
+  const int n1 = atom_base + atom_in_warp;
+  const bool valid_atom = n1 < N2;
+  const int source_atom = valid_atom ? n1 : N1;
+
+  __shared__ float shared_sum[atoms_per_warp * sum_per_atom];
+  __shared__ float shared_Fp[atoms_per_warp * Fp_per_atom];
+  __shared__ float shared_pull[atoms_per_warp * sum_per_atom];
+
+  for (int index = lane; index < atoms_per_warp * sum_per_atom; index += 32) {
+    const int local_atom = index % atoms_per_warp;
+    const int component = index / atoms_per_warp;
+    const int atom = atom_base + local_atom < N2 ? atom_base + local_atom : N1;
+    shared_sum[local_atom * sum_per_atom + component] =
+      g_sum_fxyz[static_cast<size_t>(N) * component + atom];
+  }
+  for (int index = lane; index < atoms_per_warp * Fp_per_atom; index += 32) {
+    const int local_atom = index % atoms_per_warp;
+    const int component = index / atoms_per_warp;
+    const int order = component / max_angular_channels;
+    const int channel = component % max_angular_channels;
+    const int atom = atom_base + local_atom < N2 ? atom_base + local_atom : N1;
+    float value = 0.0f;
+    if (channel < paramb.num_L) {
+      const int descriptor = paramb.n_max_radial + 1 + channel * num_angular_orders + order;
+      value = g_Fp[static_cast<size_t>(N) * descriptor + atom];
+    }
+    shared_Fp[local_atom * Fp_per_atom + component] = value;
+  }
+  __syncthreads();
+
+  if (edge_lane < num_angular_orders) {
+    const float* sum =
+      shared_sum + atom_in_warp * sum_per_atom + edge_lane * num_angular_components;
+    const float* Fp =
+      shared_Fp + atom_in_warp * Fp_per_atom + edge_lane * max_angular_channels;
+    float* pull =
+      shared_pull + atom_in_warp * sum_per_atom + edge_lane * num_angular_components;
+    build_l4_angular_pull(paramb, sum, Fp, pull);
+  }
+  __syncthreads();
+
+  float owned_pull[rounds][num_angular_orders];
+#pragma unroll
+  for (int round = 0; round < rounds; ++round) {
+#pragma unroll
+    for (int n = 0; n < num_angular_orders; ++n) {
+      owned_pull[round][n] = shared_pull[
+        atom_in_warp * sum_per_atom + n * num_angular_components + round * edges_per_atom + edge_lane];
+    }
+  }
+
+  int neighbor_count = 0;
+  int type1 = 0;
+  double x1 = 0.0;
+  double y1 = 0.0;
+  double z1 = 0.0;
+  if (edge_lane == 0 && valid_atom) {
+    neighbor_count = g_NN_angular[n1];
+    type1 = g_type[n1];
+    x1 = g_x[n1];
+    y1 = g_y[n1];
+    z1 = g_z[n1];
+  }
+  neighbor_count = __shfl_sync(0xffffffffu, neighbor_count, 0, edges_per_atom);
+  type1 = __shfl_sync(0xffffffffu, type1, 0, edges_per_atom);
+  x1 = __shfl_sync(0xffffffffu, x1, 0, edges_per_atom);
+  y1 = __shfl_sync(0xffffffffu, y1, 0, edges_per_atom);
+  z1 = __shfl_sync(0xffffffffu, z1, 0, edges_per_atom);
+
+  int maximum_neighbor_count = neighbor_count;
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    maximum_neighbor_count = max(
+      maximum_neighbor_count, __shfl_xor_sync(0xffffffffu, maximum_neighbor_count, offset));
+  }
+
+  float center_force[3] = {0.0f};
+  float center_virial[9] = {0.0f};
+  const int basis_count = paramb.basis_size_angular + 1;
+  const int coefficient_count_per_pair = num_angular_orders * basis_count;
+  const int batch_count = (maximum_neighbor_count + edges_per_atom - 1) / edges_per_atom;
+  for (int batch = 0; batch < batch_count; ++batch) {
+    const int slot = batch * edges_per_atom + edge_lane;
+    const bool active_edge = valid_atom && slot < neighbor_count;
+    int n2 = source_atom;
+    float r12[3] = {1.0f, 0.0f, 0.0f};
+    float distance = 1.0f;
+    float inverse_distance = 1.0f;
+    float unit[3] = {1.0f, 0.0f, 0.0f};
+    float gn[num_angular_orders] = {0.0f};
+    float gnp[num_angular_orders] = {0.0f};
+    if (active_edge) {
+      n2 = g_NL_angular[n1 + N * slot];
+      r12[0] = g_x[n2] - x1;
+      r12[1] = g_y[n2] - y1;
+      r12[2] = g_z[n2] - z1;
+      apply_mic(box, r12[0], r12[1], r12[2]);
+      distance = sqrt(r12[0] * r12[0] + r12[1] * r12[1] + r12[2] * r12[2]);
+      inverse_distance = 1.0f / distance;
+      unit[0] = r12[0] * inverse_distance;
+      unit[1] = r12[1] * inverse_distance;
+      unit[2] = r12[2] * inverse_distance;
+      const int type2 = g_type[n2];
+      const float cutoff = (paramb.rc_angular[type1] + paramb.rc_angular[type2]) * 0.5f;
+      const float* coefficients = annmb.c_type_pair + paramb.num_c_radial +
+        (type1 * paramb.num_types + type2) * coefficient_count_per_pair;
+      find_angular_radial_response<num_angular_orders>(
+        paramb.basis_size_angular, cutoff, 1.0f / cutoff, distance, coefficients, gn, gnp);
+    }
+
+    float force[3] = {0.0f};
+#pragma unroll
+    for (int round = 0; round < rounds; ++round) {
+#pragma unroll
+      for (int source_lane = 0; source_lane < edges_per_atom; ++source_lane) {
+        float gn_scale = 0.0f;
+        float gnp_scale = 0.0f;
+        contract_angular_pull<num_angular_orders, edges_per_atom>(
+          owned_pull[round], source_lane, gn, gnp, gn_scale, gnp_scale);
+        accumulate_angular_component(
+          round * edges_per_atom + source_lane,
+          gn_scale,
+          gnp_scale,
+          inverse_distance,
+          unit,
+          force);
+      }
+    }
+
+    if (active_edge) {
+      center_force[0] += force[0];
+      center_force[1] += force[1];
+      center_force[2] += force[2];
+      atomicAdd(g_fx + n2, -static_cast<double>(force[0]));
+      atomicAdd(g_fy + n2, -static_cast<double>(force[1]));
+      atomicAdd(g_fz + n2, -static_cast<double>(force[2]));
+      center_virial[0] -= r12[0] * force[0];
+      center_virial[1] -= r12[1] * force[1];
+      center_virial[2] -= r12[2] * force[2];
+      center_virial[3] -= r12[0] * force[1];
+      center_virial[4] -= r12[0] * force[2];
+      center_virial[5] -= r12[1] * force[2];
+      center_virial[6] -= r12[1] * force[0];
+      center_virial[7] -= r12[2] * force[0];
+      center_virial[8] -= r12[2] * force[1];
+    }
+  }
+
+#pragma unroll
+  for (int offset = edges_per_atom / 2; offset > 0; offset >>= 1) {
+#pragma unroll
+    for (int component = 0; component < 3; ++component) {
+      center_force[component] +=
+        __shfl_down_sync(0xffffffffu, center_force[component], offset, edges_per_atom);
+    }
+#pragma unroll
+    for (int component = 0; component < 9; ++component) {
+      center_virial[component] +=
+        __shfl_down_sync(0xffffffffu, center_virial[component], offset, edges_per_atom);
+    }
+  }
+  if (edge_lane == 0 && valid_atom) {
+    atomicAdd(g_fx + n1, static_cast<double>(center_force[0]));
+    atomicAdd(g_fy + n1, static_cast<double>(center_force[1]));
+    atomicAdd(g_fz + n1, static_cast<double>(center_force[2]));
+#pragma unroll
+    for (int component = 0; component < 9; ++component) {
+      g_virial[n1 + static_cast<size_t>(component) * N] += center_virial[component];
+    }
+  }
+}
+
+static bool launch_find_force_angular(
+  const int grid_size,
+  const int block_size,
+  NEP::ParaMB paramb,
+  NEP::ANN annmb,
+  const int N,
+  const int N1,
+  const int N2,
+  const Box box,
+  const int* g_NN_angular,
+  const int* g_NL_angular,
+  const int* g_type,
+  const double* g_x,
+  const double* g_y,
+  const double* g_z,
+  const float* g_Fp,
+  const float* g_sum_fxyz,
+  float* g_f12x,
+  float* g_f12y,
+  float* g_f12z,
+  const bool is_dipole,
+  const bool need_peratom_virial,
+  double* g_fx,
+  double* g_fy,
+  double* g_fz,
+  double* g_virial)
+{
+  const int num_angular_orders = paramb.n_max_angular + 1;
+  const int num_angular_channels = paramb.L_max +
+    static_cast<int>(paramb.has_q_222 != 0) +
+    static_cast<int>(paramb.has_q_1111 != 0) +
+    static_cast<int>(paramb.has_q_112 != 0) +
+    static_cast<int>(paramb.has_q_123 != 0) +
+    static_cast<int>(paramb.has_q_233 != 0) +
+    static_cast<int>(paramb.has_q_134 != 0);
+  const bool use_direct_force =
+    !is_dipole && !need_peratom_virial && paramb.model_type == 0 && paramb.L_max == 4 &&
+    paramb.num_L == num_angular_channels &&
+    paramb.dim_angular == num_angular_orders * num_angular_channels &&
+    (num_angular_orders == 3 || num_angular_orders == 5);
+  if (use_direct_force) {
+    const int tile_grid_size = (N2 - N1 + 3) / 4;
+    if (num_angular_orders == 3) {
+      find_force_angular_l4<3><<<tile_grid_size, 32>>>(
+        paramb, annmb, N, N1, N2, box, g_NN_angular, g_NL_angular, g_type, g_x, g_y, g_z,
+        g_Fp, g_sum_fxyz, g_fx, g_fy, g_fz, g_virial);
+    } else {
+      find_force_angular_l4<5><<<tile_grid_size, 32>>>(
+        paramb, annmb, N, N1, N2, box, g_NN_angular, g_NL_angular, g_type, g_x, g_y, g_z,
+        g_Fp, g_sum_fxyz, g_fx, g_fy, g_fz, g_virial);
+    }
+  } else {
+    find_partial_force_angular<<<grid_size, block_size>>>(
+      paramb,
+      annmb,
+      N,
+      N1,
+      N2,
+      box,
+      g_NN_angular,
+      g_NL_angular,
+      g_type,
+      g_x,
+      g_y,
+      g_z,
+      g_Fp,
+      g_sum_fxyz,
+      g_f12x,
+      g_f12y,
+      g_f12z);
+  }
+  return use_direct_force;
 }
 
 static __global__ void find_force_ZBL(
@@ -997,29 +1806,57 @@ void NEP::compute_large_box(
   }
 
   bool is_polarizability = paramb.model_type == 2;
-  find_descriptor<<<grid_size, BLOCK_SIZE>>>(
-    paramb,
-    annmb,
-    N,
-    N1,
-    N2,
-    box,
-    nep_data.NN_radial.data(),
-    nep_data.NL_radial.data(),
-    nep_data.NN_angular.data(),
-    nep_data.NL_angular.data(),
-    type.data(),
-    position_per_atom.data(),
-    position_per_atom.data() + N,
-    position_per_atom.data() + N * 2,
-    is_polarizability,
-    potential_per_atom.data(),
-    nep_data.Fp.data(),
-    virial_per_atom.data(),
-    nep_data.sum_fxyz.data(),
-    need_B_projection,
-    B_projection,
-    B_projection_size);
+  const size_t radial_basis_sum_bytes = static_cast<size_t>(BLOCK_SIZE) *
+    (paramb.basis_size_radial + 1) * sizeof(float);
+  if (paramb.num_types == 1) {
+    find_descriptor<true><<<grid_size, BLOCK_SIZE, radial_basis_sum_bytes>>>(
+      paramb,
+      annmb,
+      N,
+      N1,
+      N2,
+      box,
+      nep_data.NN_radial.data(),
+      nep_data.NL_radial.data(),
+      nep_data.NN_angular.data(),
+      nep_data.NL_angular.data(),
+      type.data(),
+      position_per_atom.data(),
+      position_per_atom.data() + N,
+      position_per_atom.data() + N * 2,
+      is_polarizability,
+      potential_per_atom.data(),
+      nep_data.Fp.data(),
+      virial_per_atom.data(),
+      nep_data.sum_fxyz.data(),
+      need_B_projection,
+      B_projection,
+      B_projection_size);
+  } else {
+    find_descriptor<false><<<grid_size, BLOCK_SIZE>>>(
+      paramb,
+      annmb,
+      N,
+      N1,
+      N2,
+      box,
+      nep_data.NN_radial.data(),
+      nep_data.NL_radial.data(),
+      nep_data.NN_angular.data(),
+      nep_data.NL_angular.data(),
+      type.data(),
+      position_per_atom.data(),
+      position_per_atom.data() + N,
+      position_per_atom.data() + N * 2,
+      is_polarizability,
+      potential_per_atom.data(),
+      nep_data.Fp.data(),
+      virial_per_atom.data(),
+      nep_data.sum_fxyz.data(),
+      need_B_projection,
+      B_projection,
+      B_projection_size);
+  }
   GPU_CHECK_KERNEL
 
   bool is_dipole = paramb.model_type == 1;
@@ -1044,7 +1881,9 @@ void NEP::compute_large_box(
     virial_per_atom.data());
   GPU_CHECK_KERNEL
 
-  find_partial_force_angular<<<grid_size, BLOCK_SIZE>>>(
+  bool angular_force_is_direct = launch_find_force_angular(
+    grid_size,
+    BLOCK_SIZE,
     paramb,
     annmb,
     N,
@@ -1061,21 +1900,29 @@ void NEP::compute_large_box(
     nep_data.sum_fxyz.data(),
     nep_data.f12x.data(),
     nep_data.f12y.data(),
-    nep_data.f12z.data());
-  GPU_CHECK_KERNEL
-
-  find_properties_many_body(
-    box,
-    nep_data.NN_angular.data(),
-    nep_data.NL_angular.data(),
-    nep_data.f12x.data(),
-    nep_data.f12y.data(),
     nep_data.f12z.data(),
     is_dipole,
-    position_per_atom,
-    force_per_atom,
-    virial_per_atom);
+    need_peratom_virial,
+    force_per_atom.data(),
+    force_per_atom.data() + N,
+    force_per_atom.data() + N * 2,
+    virial_per_atom.data());
   GPU_CHECK_KERNEL
+
+  if (!angular_force_is_direct) {
+    find_properties_many_body(
+      box,
+      nep_data.NN_angular.data(),
+      nep_data.NL_angular.data(),
+      nep_data.f12x.data(),
+      nep_data.f12y.data(),
+      nep_data.f12z.data(),
+      is_dipole,
+      position_per_atom,
+      force_per_atom,
+      virial_per_atom);
+    GPU_CHECK_KERNEL
+  }
 
   if (zbl.enabled) {
     find_force_ZBL<<<grid_size, BLOCK_SIZE>>>(
@@ -1398,9 +2245,11 @@ static __global__ void find_descriptor(
       for (int n = 0; n <= paramb.n_max_radial; ++n) {
         float gn12 = 0.0f;
         for (int k = 0; k <= paramb.basis_size_radial; ++k) {
-          int c_index = (n * (paramb.basis_size_radial + 1) + k) * paramb.num_types_sq;
-          c_index += t1 * paramb.num_types + t2;
-          gn12 += fn12[k] * annmb.c[c_index];
+          int c_index =
+            (t1 * paramb.num_types + t2) *
+              ((paramb.n_max_radial + 1) * (paramb.basis_size_radial + 1)) +
+            n * (paramb.basis_size_radial + 1) + k;
+          gn12 += fn12[k] * annmb.c_type_pair[c_index];
         }
         q[n] += gn12;
       }
@@ -1425,9 +2274,12 @@ static __global__ void find_descriptor(
         find_fn(paramb.basis_size_angular, rcinv, d12, fc12, fn12);
         float gn12 = 0.0f;
         for (int k = 0; k <= paramb.basis_size_angular; ++k) {
-          int c_index = (n * (paramb.basis_size_angular + 1) + k) * paramb.num_types_sq;
-          c_index += t1 * paramb.num_types + t2 + paramb.num_c_radial;
-          gn12 += fn12[k] * annmb.c[c_index];
+          int c_index =
+            paramb.num_c_radial +
+            (t1 * paramb.num_types + t2) *
+              ((paramb.n_max_angular + 1) * (paramb.basis_size_angular + 1)) +
+            n * (paramb.basis_size_angular + 1) + k;
+          gn12 += fn12[k] * annmb.c_type_pair[c_index];
         }
         accumulate_s(paramb.L_max, d12, x12, y12, z12, gn12, s);
       }
@@ -1561,7 +2413,9 @@ void NEP::compute_large_box(
     virial_per_atom.data());
   GPU_CHECK_KERNEL
 
-  find_partial_force_angular<<<grid_size, BLOCK_SIZE>>>(
+  bool angular_force_is_direct = launch_find_force_angular(
+    grid_size,
+    BLOCK_SIZE,
     paramb,
     annmb,
     N,
@@ -1578,21 +2432,29 @@ void NEP::compute_large_box(
     nep_data.sum_fxyz.data(),
     nep_data.f12x.data(),
     nep_data.f12y.data(),
-    nep_data.f12z.data());
-  GPU_CHECK_KERNEL
-
-  find_properties_many_body(
-    box,
-    nep_data.NN_angular.data(),
-    nep_data.NL_angular.data(),
-    nep_data.f12x.data(),
-    nep_data.f12y.data(),
     nep_data.f12z.data(),
     is_dipole,
-    position_per_atom,
-    force_per_atom,
-    virial_per_atom);
+    need_peratom_virial,
+    force_per_atom.data(),
+    force_per_atom.data() + N,
+    force_per_atom.data() + N * 2,
+    virial_per_atom.data());
   GPU_CHECK_KERNEL
+
+  if (!angular_force_is_direct) {
+    find_properties_many_body(
+      box,
+      nep_data.NN_angular.data(),
+      nep_data.NL_angular.data(),
+      nep_data.f12x.data(),
+      nep_data.f12y.data(),
+      nep_data.f12z.data(),
+      is_dipole,
+      position_per_atom,
+      force_per_atom,
+      virial_per_atom);
+    GPU_CHECK_KERNEL
+  }
 
   if (zbl.enabled) {
     find_force_ZBL<<<grid_size, BLOCK_SIZE>>>(

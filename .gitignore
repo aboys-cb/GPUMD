@@ -30,3 +30,7 @@ __pycache__/
 .hypothesis/
 README.gnep.md
 push-to-both.sh
+
+# Local CUDA optimization and remote-run artifacts
+/diagnostics/cuda_optimization/
+/tmp/hpc-platform/

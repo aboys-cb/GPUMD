@@ -24,6 +24,7 @@ struct NEP_Data {
   GPU_Vector<float> f12x; // 3-body or manybody partial forces
   GPU_Vector<float> f12y; // 3-body or manybody partial forces
   GPU_Vector<float> f12z; // 3-body or manybody partial forces
+  GPU_Vector<float> descriptor;
   GPU_Vector<float> Fp;
   GPU_Vector<float> sum_fxyz;
   GPU_Vector<float> descriptor_parameters_type_pair;
@@ -31,6 +32,8 @@ struct NEP_Data {
   GPU_Vector<int> NL_radial;    // radial neighbor list
   GPU_Vector<int> NN_angular;   // angular neighbor list
   GPU_Vector<int> NL_angular;   // angular neighbor list
+  GPU_Vector<int> ann_scheduled_atoms;
+  GPU_Vector<int> ann_schedule_identity;
   GPU_Vector<float> parameters; // parameters to be optimized
   std::vector<int> cpu_NN_radial;
   std::vector<int> cpu_NN_angular;
